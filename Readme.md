@@ -3,6 +3,7 @@
 #### This is a vanity mode mod for Borderlands 4, that specifically targets Loveless.
 ### I have included only her idle animations to be played! 
 ### Other characters are not supported!
+### Colour Override does not apply to the character in main menu/inventory, only in the gameworld!
 ## Features
 - Auto-Rotating Orbit Mode Camera on being idle
 - Contextual Idle Animations
