@@ -1,0 +1,11 @@
+[project]
+name = "VanityMode"
+version = "1.0"
+description = "BL4 vanity mode toggle for Loveless."
+authors = [{ name = "Phnx" }]
+
+[tool.sdkmod]
+name = "BL4 Vanity Mode"
+version = "1.0"
+supported_games = ["BL4"]
+coop_support = "ClientSide"
