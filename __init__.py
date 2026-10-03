@@ -1,9 +1,7 @@
-import math
-import random
-import time
+import math, random, threading, time
 from typing import Any
-from mods_base import get_pc, SliderOption, Game, build_mod, hook, keybind, GroupedOption
-from unrealsdk import find_class, find_object, make_struct # , hooks
+from mods_base import get_pc, SliderOption , Game, build_mod, hook, keybind, GroupedOption
+from unrealsdk import find_class, find_object, make_struct #, hooks
 from unrealsdk.hooks import Type
 assert __import__("mods_base").__version_info__ >= (1, 11), "Please update mods_base"
 assert __import__("unrealsdk").__version_info__ >= (1, 3, 0), "Please update unrealsdk"
@@ -39,25 +37,38 @@ WYRM_OUT_DELAY = 0.15       # seconds the wyrm stays visible under the burst bef
 WYRM_REQUIRE_OUT_FX = False # True: only pick the wyrm fidget when the burst is loaded too
 
 EYE_OVERRIDE = {
-    "Emissive Color": ("vector", (0.10, 0.50, 0.15)),
+    "Emissive Color": ("vector", (0.1, 0.5, 0.15)),
     "Emissive Strength Iris": ("scalar", 30.0),
 }
 HAIR_OVERRIDE = {
-    "Color Root": ("vector", (0.30, 0.0, 0.0)),
-    "Color Tips": ("vector", (0.75, 0.10, 0.10)),
+    "Color Root": ("vector", (0.1, 0.0, 0.0)),
+    "Color Tips": ("vector", (0.5, 0.05, 0.05)),
 }
 _mine = {}             # (component, slot) -> path of the MID we last wrote
 _next_check = 0.0
+
+# Stand-ins are the copies of the character the game shows in menus, the
+# inventory and cutscenes. They're OakCharacterStandIn actors, not Characters,
+# and their anim blueprint doesn't override BlueprintUpdateAnimation, so the
+# engine calls the base AnimInstance version for them - on the game thread.
+# Anim classes stand-ins are known to use. The inventory stand-in runs the same
+# BPAnim_Player_3rd_C as the in-world pawn, so the owning actor's class is what
+# finally decides; the anim class is only a cheap first filter.
+STANDIN_ANIM_CLASSES = ("BPAnim_Player_StandIn_C", "BPAnim_Player_3rd_C", "BPAnim_Player_CinematicStandIn_C")
+STANDIN_ACTOR_CLASS = "OakCharacterStandIn"
+STANDIN_CHARACTER = "Char_CorpoHacker"      # GetLinkedActorDefName() of the copies to recolour
+_standin_next = {}     # anim instance path -> next time it's due a check
+GAME_THREAD = threading.get_ident()         # pyexec / mod load runs on the game thread
 
 
 # ---------------------------------------------------------------- slider options
 
 eye_glow_color_r = SliderOption(
     "Eye Glow Colour Red",
-    0.10,
+    0.1,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Eye Glow Colour Red",
     description="Eye Glow Colour Red Value.",
@@ -65,10 +76,10 @@ eye_glow_color_r = SliderOption(
 
 eye_glow_color_g = SliderOption(
     "Eye Glow Colour Green",
-    0.50,
+    0.5,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Eye Glow Colour Green",
     description="Eye Glow Colour Green Value.",
@@ -79,7 +90,7 @@ eye_glow_color_b = SliderOption(
     0.15,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Eye Glow Colour Blue",
     description="Eye Glow Colour Blue Value.",
@@ -98,10 +109,10 @@ eye_glow_str = SliderOption(
 
 hair_root_color_r = SliderOption(
     "Hair Root Colour Red",
-    0.30,
+    0.1,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Hair Root Colour Red",
     description="Hair Root Colour Red Value.",
@@ -112,7 +123,7 @@ hair_root_color_g = SliderOption(
     0.0,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Hair Root Colour Green",
     description="Hair Root Colour Green Value.",
@@ -123,7 +134,7 @@ hair_root_color_b = SliderOption(
     0.0,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Hair Root Colour Blue",
     description="Hair Root Colour Blue Value.",
@@ -131,10 +142,10 @@ hair_root_color_b = SliderOption(
 
 hair_tips_color_r = SliderOption(
     "Hair Tips Colour Red",
-    0.75,
+    0.5,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Hair Tips Colour Red",
     description="Hair Tips Colour Red Value.",
@@ -142,10 +153,10 @@ hair_tips_color_r = SliderOption(
 
 hair_tips_color_g = SliderOption(
     "Hair Tips Colour Green",
-    0.10,
+    0.05,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Hair Tips Colour Green",
     description="Hair Tips Colour Green Value.",
@@ -153,10 +164,10 @@ hair_tips_color_g = SliderOption(
 
 hair_tips_color_b = SliderOption(
     "Hair Tips Colour Blue",
-    0.10,
+    0.05,
     0.0,
     1.0,
-    step=1.0,
+    step=0.01,
     is_integer=False,
     display_name="Hair Tips Colour Blue",
     description="Hair Tips Colour Blue Value.",
@@ -663,21 +674,23 @@ def _apply(mid, OVERRIDE):
         for name, (kind, val) in OVERRIDE.items():
             if kind == "vector":
                 # mid.SetVectorParameterValue(name, make_struct("LinearColor", R=val[0], G=val[1], B=val[2], A=1.0))
-                mid.SetVectorParameterValue(name, make_struct("LinearColor", R=float(eye_glow_color_r.value), G=float(eye_glow_color_g.value), B=float(eye_glow_color_b.value), A=1.0))
+                mid.SetVectorParameterValue(name, make_struct("LinearColor", R=eye_glow_color_r.value, G=eye_glow_color_g.value, B=eye_glow_color_b.value, A=1.0))
             else:
                 # mid.SetScalarParameterValue(name, val)
-                mid.SetScalarParameterValue(name, float(eye_glow_str.value))
+                mid.SetScalarParameterValue(name, eye_glow_str.value)
     elif OVERRIDE == HAIR_OVERRIDE:
+        sliders = {
+            "Color Root": (hair_root_color_r, hair_root_color_g, hair_root_color_b),
+            "Color Tips": (hair_tips_color_r, hair_tips_color_g, hair_tips_color_b),
+        }
         for name, (kind, val) in OVERRIDE.items():
+            r, g, b = (o.value for o in sliders[name]) if name in sliders else val
+            color = make_struct("LinearColor", R=r, G=g, B=b, A=1.0)
             info = param_info(mid.Parent, name)  # the identity the material really uses
             if info is not None:
-                # mid.SetVectorParameterValueByInfo(info, make_struct("LinearColor", R=val[0], G=val[1], B=val[2], A=1.0))
-                if "root" in str(info).lower():
-                    mid.SetVectorParameterValueByInfo(info, make_struct("LinearColor", R=float(hair_root_color_r.value), G=float(hair_root_color_g.value), B=float(hair_root_color_b.value), A=1.0))
-                elif "tips" in str(info).lower():
-                    mid.SetVectorParameterValueByInfo(info, make_struct("LinearColor", R=float(hair_tips_color_r.value), G=float(hair_tips_color_g.value), B=float(hair_tips_color_b.value), A=1.0))
+                mid.SetVectorParameterValueByInfo(info, color)
             else:
-                mid.SetVectorParameterValue(name, make_struct("LinearColor", R=val[0], G=val[1], B=val[2], A=1.0))
+                mid.SetVectorParameterValue(name, color)
 
 
 def color_watchdog_sub(m, c, i, OVERRIDE, key):
@@ -686,12 +699,9 @@ def color_watchdog_sub(m, c, i, OVERRIDE, key):
     _mine[key] = mid._path_name()
 
 
-def color_watchdog(pawn, now):
-    global _next_check
-    if now < _next_check:
-        return
-    _next_check = now + 0.5
-    for c in pawn.K2_GetComponentsByClass(find_class("MeshComponent")):
+def _recolor(actor):
+    """Apply the eye and hair overrides to any actor wearing the character's materials."""
+    for c in actor.K2_GetComponentsByClass(find_class("MeshComponent")):
         for i in range(c.GetNumMaterials()):
             m = c.GetMaterial(i)
             if m is not None and "eye" in str(m.Name).lower() and "eyeshadow" not in str(m.Name).lower():
@@ -704,6 +714,59 @@ def color_watchdog(pawn, now):
                 if _mine.get(key) == m._path_name():
                     continue  # still ours, nothing undid it
                 color_watchdog_sub(m, c, i, HAIR_OVERRIDE, key)
+
+
+def color_watchdog(pawn, now):
+    global _next_check
+    if now < _next_check:
+        return
+    _next_check = now + 0.5
+    _recolor(pawn)
+
+
+def _standin_is_mine(actor):
+    """This character, and linked to our player - or to no player (UI thumbnails)."""
+    try:
+        if str(actor.GetLinkedActorDefName()) != STANDIN_CHARACTER:
+            return False
+        ps = actor.GetLinkedPlayerState()
+        if ps is None:
+            return True
+        pc = get_pc_safe()
+        mine = getattr(pc, "PlayerState", None) if pc else None
+        return mine is None or _key(ps) == _key(mine)
+    except Exception:
+        return False
+
+
+@hook("/Script/Engine.AnimInstance:BlueprintUpdateAnimation", Type.PRE)
+def standin_tick(obj, args, ret, func) -> None:
+    if str(obj.Class.Name) not in STANDIN_ANIM_CLASSES:
+        return                                  # fires for many anim instances; leave fast
+    if not _co_enabled:
+        return                                  # same toggle as the pawn's colour override
+    if threading.get_ident() != GAME_THREAD:
+        return                                  # never touch materials off the game thread
+    now = time.monotonic()
+    # throttle per anim instance, before any engine call, so the in-world pawn
+    # (which shares BPAnim_Player_3rd_C) costs one lookup per frame
+    key = _key(obj)
+    if now < _standin_next.get(key, 0.0):
+        return
+    _standin_next[key] = now + 0.5
+    # stand-ins are recreated often; clearing is safe, it only costs one re-apply
+    if len(_standin_next) > 64:
+        _standin_next.clear()
+    if len(_mine) > 256:
+        _mine.clear()
+    try:
+        actor = obj.GetOwningActor()
+    except Exception:
+        return
+    if actor is None or str(actor.Class.Name) != STANDIN_ACTOR_CLASS:
+        return                                  # the pawn itself, or anything else
+    if _standin_is_mine(actor):
+        _recolor(actor)
 
 
 # ---------------------------------------------------------------- main loop
@@ -794,8 +857,10 @@ def vanity_tick(obj, args, ret, func) -> None:
         return
     _start(entry, body, pawn, cm, now)
 
-# hooks.remove_hook("/Game/PlayerCharacters/_Shared/Animation/BPAnim_Player_1st.BPAnim_Player_1st_C:BlueprintUpdateAnimation", Type.PRE, "vanity_tick")
-# hooks.add_hook("/Game/PlayerCharacters/_Shared/Animation/BPAnim_Player_1st.BPAnim_Player_1st_C:BlueprintUpdateAnimation", Type.PRE, "vanity_tick", vanity_tick)
+"""hooks.remove_hook("/Game/PlayerCharacters/_Shared/Animation/BPAnim_Player_1st.BPAnim_Player_1st_C:BlueprintUpdateAnimation", Type.PRE, "vanity_tick")
+hooks.add_hook("/Game/PlayerCharacters/_Shared/Animation/BPAnim_Player_1st.BPAnim_Player_1st_C:BlueprintUpdateAnimation", Type.PRE, "vanity_tick", vanity_tick)
+hooks.remove_hook("/Script/Engine.AnimInstance:BlueprintUpdateAnimation", Type.PRE, "standin_tick")
+hooks.add_hook("/Script/Engine.AnimInstance:BlueprintUpdateAnimation", Type.PRE, "standin_tick", standin_tick)"""
 
 @keybind("Vanity Mode Toggle", "N", display_name="Vanity Mode Toggle")
 def vm_toggle() -> None:
@@ -821,6 +886,7 @@ def on_disable() -> None:
     _enabled = False
     _co_enabled = False
     vanity_tick.disable()
+    standin_tick.disable()
     print("Vanity Mode inactive!")
     print("Color Override inactive!")
 
@@ -830,6 +896,7 @@ def on_enable() -> None:
     _co_enabled = True
     _schedule(time.monotonic())
     vanity_tick.enable()
+    standin_tick.enable()
     print("Vanity Mode active!")
     print("Color Override active!")
 
